@@ -1,8 +1,22 @@
-"""Arrival-event FCFS scheduler with explicit service-completion heap and independent replications."""
+"""Arrival-event FCFS scheduler with explicit service-completion heap and independent replications.
+
+The public helpers are deliberately split so that a resumable worker can compute a
+single replication at a time and still reproduce exactly the numbers produced by an
+uninterrupted ``simulate_replicates`` call.  Every replication derives its streams
+from ``SeedSequence(root).spawn(replications)`` using its stable zero-based index;
+the aggregation step therefore never depends on how many earlier attempts ran.
+"""
 import heapq,math
 import numpy as np
 from scipy.stats import t
 from .erlang_algorithm import erlang_c
+
+
+def _validate_run_parameters(customers,warmup,replications,seed):
+    if type(customers) is not int or not 500<=customers<=10000 or type(warmup) is not int or not 0<=warmup<=5000 or customers-warmup<100:raise ValueError("顾客500–10000，warmup最多5000且至少保留100个顾客")
+    if type(replications) is not int or not 5<=replications<=40 or customers*replications>250000:raise ValueError("重复5–40次，单任务总顾客上限250000")
+    if type(seed) is not int or not 0<=seed<=2147483647:raise ValueError("随机种子须为0到2147483647整数")
+
 
 def schedule_fcfs(arrivals,services,servers,warmup=0):
     if type(servers) is not int or not 1<=servers<=20:raise ValueError("服务台数量无效")
@@ -28,20 +42,51 @@ def mean_t_interval(values,confidence=.95):
     mean=float(np.mean(values));sd=float(np.std(values,ddof=1));se=sd/math.sqrt(len(values));critical=float(t.ppf((1+confidence)/2,len(values)-1))
     return {"mean":mean,"lower":mean-critical*se,"upper":mean+critical*se,"standard_error":se,"degrees_of_freedom":len(values)-1,"critical_t":critical,"degenerate":sd==0,"confidence":confidence}
 
+
+def replication_streams(seed,replications):
+    """Return the stable root -> replication child streams used by a run."""
+    if type(replications) is not int or not 5<=replications<=40:raise ValueError("重复5–40次，单任务总顾客上限250000")
+    if type(seed) is not int or not 0<=seed<=2147483647:raise ValueError("随机种子须为0到2147483647整数")
+    return np.random.SeedSequence(seed).spawn(replications)
+
+
+def simulate_replication(arrival_rate,service_rate,servers,customers=3000,warmup=500,replications=20,seed=2026,index=0,streams=None):
+    """Compute one independent replication by its stable zero-based index.
+
+    Returns ``(summary, sample_customers)``.  ``summary`` is exactly the element an
+    uninterrupted run would place in ``result["replications"]``; ``sample_customers``
+    is non-empty only for the first replication so that it can be persisted once.
+    """
+    _validate_run_parameters(customers,warmup,replications,seed)
+    if type(index) is not int or not 0<=index<replications:raise ValueError("重复序号超出范围")
+    if streams is None:streams=replication_streams(seed,replications)
+    arrival_child,service_child=streams[index].spawn(2)
+    arrival_rng=np.random.default_rng(arrival_child);service_rng=np.random.default_rng(service_child)
+    arrivals=np.cumsum(arrival_rng.exponential(1/arrival_rate,customers)).tolist();services=service_rng.exponential(1/service_rate,customers).tolist()
+    simulation=schedule_fcfs(arrivals,services,servers,warmup);records=simulation.pop('records')
+    summary={"replication":index+1,"arrival_spawn_key":list(arrival_child.spawn_key),"service_spawn_key":list(service_child.spawn_key),**simulation}
+    sample=[]
+    if index==0:
+        sample=records[::max(1,len(records)//100)]
+        if sample[-1]['customer']!=records[-1]['customer']:sample.append(records[-1])
+    return summary,sample
+
+
+def aggregate_replicates(analytic,results,sample_customers,customers,warmup,replications,seed,confidence=.95):
+    """Build the final result from persisted per-replication summaries only."""
+    if len(results)!=replications or sorted(r.get("replication") for r in results)!=list(range(1,replications+1)):
+        raise ValueError("独立重复结果不完整，不能汇总发布")
+    results=sorted(results,key=lambda item:item["replication"])
+    interval=mean_t_interval([r['mean_wait_minutes'] for r in results],confidence)
+    return {"analytical":analytic,"replications":results,"wait_interval":interval,"system_interval":mean_t_interval([r['mean_system_minutes'] for r in results],confidence),"mean_wait_probability":float(np.mean([r['wait_probability'] for r in results])),"mean_busy_fraction_window":float(np.mean([r['busy_fraction_window'] for r in results])),"sample_customers":sample_customers,"customers":customers,"warmup":warmup,"retained_per_replication":customers-warmup,"replication_count":replications,"seed":seed,"mean_difference_minutes":interval['mean']-analytic['mean_wait_minutes'],"assumptions":"Poisson到达、同速独立指数服务、无限等待空间、FCFS、同刻按顾客输入顺序；初始系统为空。暖机按每次重复的前warmup个顾客剔除。","ci_note":"区间是独立重复的平均等待均值t区间，不是顾客独立样本区间；不含模型或暖机偏差，未经非负截断。","finite_window_note":"仿真生成固定顾客数并服务至全部完成；忙碌率窗口从首个保留顾客到达到全部服务完成，含排空效应，不等于稳态解析精确值。"}
+
+
 def simulate_replicates(arrival_rate,service_rate,servers,customers=3000,warmup=500,replications=20,seed=2026,confidence=.95):
     analytic=erlang_c(arrival_rate,service_rate,servers)
-    if type(customers) is not int or not 500<=customers<=10000 or type(warmup) is not int or not 0<=warmup<=5000 or customers-warmup<100:raise ValueError("顾客500–10000，warmup最多5000且至少保留100个顾客")
-    if type(replications) is not int or not 5<=replications<=40 or customers*replications>250000:raise ValueError("重复5–40次，单任务总顾客上限250000")
-    if type(seed) is not int or not 0<=seed<=2147483647:raise ValueError("随机种子须为0到2147483647整数")
-    streams=np.random.SeedSequence(seed).spawn(replications);results=[];sample=[]
-    for index,child in enumerate(streams):
-        arrival_child,service_child=child.spawn(2)
-        arrival_rng=np.random.default_rng(arrival_child);service_rng=np.random.default_rng(service_child)
-        arrivals=np.cumsum(arrival_rng.exponential(1/arrival_rate,customers)).tolist();services=service_rng.exponential(1/service_rate,customers).tolist()
-        simulation=schedule_fcfs(arrivals,services,servers,warmup);records=simulation.pop('records')
-        results.append({"replication":index+1,"arrival_spawn_key":list(arrival_child.spawn_key),"service_spawn_key":list(service_child.spawn_key),**simulation})
-        if index==0:
-            sample=records[::max(1,len(records)//100)]
-            if sample[-1]['customer']!=records[-1]['customer']:sample.append(records[-1])
-    interval=mean_t_interval([r['mean_wait_minutes'] for r in results],confidence)
-    return {"analytical":analytic,"replications":results,"wait_interval":interval,"system_interval":mean_t_interval([r['mean_system_minutes'] for r in results],confidence),"mean_wait_probability":float(np.mean([r['wait_probability'] for r in results])),"mean_busy_fraction_window":float(np.mean([r['busy_fraction_window'] for r in results])),"sample_customers":sample,"customers":customers,"warmup":warmup,"retained_per_replication":customers-warmup,"replication_count":replications,"seed":seed,"mean_difference_minutes":interval['mean']-analytic['mean_wait_minutes'],"assumptions":"Poisson到达、同速独立指数服务、无限等待空间、FCFS、同刻按顾客输入顺序；初始系统为空。暖机按每次重复的前warmup个顾客剔除。","ci_note":"区间是独立重复的平均等待均值t区间，不是顾客独立样本区间；不含模型或暖机偏差，未经非负截断。","finite_window_note":"仿真生成固定顾客数并服务至全部完成；忙碌率窗口从首个保留顾客到达到全部服务完成，含排空效应，不等于稳态解析精确值。"}
+    _validate_run_parameters(customers,warmup,replications,seed)
+    streams=replication_streams(seed,replications);results=[];sample=[]
+    for index in range(replications):
+        summary,replication_sample=simulate_replication(arrival_rate,service_rate,servers,customers,warmup,replications,seed,index,streams)
+        results.append(summary)
+        if index==0:sample=replication_sample
+    return aggregate_replicates(analytic,results,sample,customers,warmup,replications,seed,confidence)

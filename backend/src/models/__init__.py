@@ -4,4 +4,6 @@ from .study import QueueStudy
 from .arrival import ArrivalProfile
 from .scenario import ServiceScenario
 from .simulation_run import SimulationRun
+from .run_replication import RunReplication
+from .run_event import RunEvent
 from .capacity_note import CapacityNote

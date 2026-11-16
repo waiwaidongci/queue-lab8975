@@ -52,6 +52,7 @@ seed按邮箱、研究code、到达配置code、服务情景code、基准运行n
 7. 提交增加第三窗口、检验到达/服务分布的后续容量假设。
 8. 陆潮以admin审阅，说明稳态与有限时段、暖机偏差和现场验证边界，批准或退回。
 9. 沈帆以viewer下载20行重复CSV；参数快照、根种子和完整结果通过运行API/共享JSON保存。
+10. 若worker在09:03崩溃，09:05该运行已由新worker接管，从已落盘的重复继续；等待对照页显示“第2次执行 / 自动接管续算”，不产生重复计算，也无需重新提交。
 
 ## 两种计算的边界
 
@@ -76,9 +77,22 @@ W = Wq+1/mu; Lq=lambda*Wq
 
 单任务500–10000顾客、暖机0–5000且保留至少100人、5–40重复、总顾客最多250000。拒绝无稳态、非法率/服务台/时长、过量任务、错误暖机。固定种子/快照支持复算；输入hash覆盖研究/到达/服务完整快照、顾客/暖机/重复/根种子/置信水平及方法版本。worker使用持久化快照，不读取后续被改动的来源备注。
 
+## 中断续算与接管
+
+试验中断后不再停在“仿真中”，也不需要重提。运行按**独立重复**落盘：每个重复算完即写入`run_replications`（`(run_id, replication)`唯一），进度只增不减。
+
+- **自动接管**：worker持有带租约的执行权（`lease_token`+`lease_expires_at`），算每个重复前续租，另有独立心跳线程。租约到期（进程崩溃、重启、网络失联）后，任何worker都会把该运行重新认领并**只补算缺失重复**；已落盘重复不重算。
+- **随机子流一致**：每个重复只用`SeedSequence(root).spawn(R)[index]`的稳定子流，不依赖尝试次数或执行顺序；汇总只用已落盘摘要，所以中断续算与不中断运行得到相同的spawn_key、重复均值、t区间、忙碌率和输入hash。
+- **并发与重复投递只认当前接管者**：认领是一条条件UPDATE，同一时刻只有一个租约有效；所有进度、失败、发布写入都以`lease_token`比对。失联者恢复后迟到的进度或结果会被拒绝，不能覆盖新成果；超过租约未到期的失联者可由admin“强制接管”，旧token立即失效。
+- **完成版本一致**：完成状态、接口结果、结果哈希`result_version`（结果文档SHA-256）和版本化结果文件`/artifacts/run-<id>-<hash前16位>.json`在同一条件更新中对应同一完整版本；结果文件按版本命名、原子写入，旧版本文件不被覆盖。汇总阶段中断也可恢复：重新从已落盘重复汇总并发布。
+- **缺重复不发布**：汇总前校验重复序列`1..R`齐全，缺失则拒绝发布，运行保持未完成且不产生完成版本。
+- **旧运行兼容**：续算改造前完成的运行没有`result_version`，仍可查看与获批导出；有版本但结果文件缺失/哈希不符的运行会标记不完整并拒绝导出。
+
+`SimulationRun`新增租约/进度/版本字段，`RunReplication`保存重复摘要，`RunEvent`记录认领、接管、保存重复、完成、失败、让出等经过。页面“等待对照”显示进度条、执行次数、当前接管者、失联提示、接管按钮和最近接管经过。启动时对已有数据库幂等应用`migrations/002_resumable_runs.sql`（补列建表），不丢旧数据。
+
 ## 页面与工程
 
-六页：容量总览、输入核对、情景与运行、等待对照、建议审阅、试验留痕。QueueStudy / ArrivalProfile / ServiceScenario / SimulationRun / CapacityNote五实体贯穿模型、schema、service、route、前端API/store及页面，User/Audit为横切。
+六页：容量总览、输入核对、情景与运行、等待对照、建议审阅、试验留痕。QueueStudy / ArrivalProfile / ServiceScenario / SimulationRun / RunReplication / CapacityNote六实体贯穿模型、schema、service、route、前端API/store及页面，RunEvent记录接管经过，User/Audit为横切。
 
 | 部分 | 技术 |
 |---|---|
@@ -91,11 +105,11 @@ W = Wq+1/mu; Lq=lambda*Wq
 backend/src/{models,schemas,services,controllers,routes,middlewares,utils,constants,config}
 backend/src/{main.py,worker.py}
 backend/scripts/seed_demo.py
-backend/migrations/001_initial.sql
+backend/migrations/{001_initial.sql,002_resumable_runs.sql}
 frontend/src/{api,stores,types,components,hooks,pages,router,utils,constants}
 ```
 
-QueueSummary/WaitComparison在首页、结果、建议共用，ReplicationChart跨首页/结果，ProfileSelector在配置复用；DataTable/Notice/StatusBadge、useAction/useResearchData、format各自分工。角色枚举`backend/src/constants/roles.py`、运行枚举`status.py`对应`frontend/src/constants/enums.ts`，路由/worker真实使用。JWT8小时、PBKDF2-SHA256、每次数据库角色授权。审计覆盖登录、备注、情景、运行和建议审批；错误与登录限流为两个中间件。
+QueueSummary/WaitComparison在首页、结果、建议共用，ReplicationChart跨首页/结果，RunActivity在结果页展示进度与接管经过，ProfileSelector在配置复用；DataTable/Notice/StatusBadge、useAction/useResearchData、format各自分工。角色枚举`backend/src/constants/roles.py`、运行枚举`status.py`对应`frontend/src/constants/enums.ts`，路由/worker真实使用。JWT8小时、PBKDF2-SHA256、每次数据库角色授权。审计覆盖登录、备注、情景、运行、续算/强制接管和建议审批；错误与登录限流为两个中间件。
 
 ## 配置与开发
 
@@ -107,6 +121,7 @@ QueueSummary/WaitComparison在首页、结果、建议共用，ReplicationChart�
 | DB_PORT | 17720 | PostgreSQL宿主映射 |
 | JWT_SECRET | local-queue-lab-change-this-key | 本地演示值，部署前更换 |
 | SEED_DEMO | true | 自动seed |
+| RUN_LEASE_SECONDS | 120 | 执行租约秒数；到期后运行可被自动接管续算 |
 
 本地Python3.11安装requirements，设置DATABASE_URL/REDIS_URL，`cd backend && uvicorn src.main:app --reload`并另起`python -m src.worker`。前端`npm install && npm run dev`，本地为`/api`配置反向代理；标准演示以Compose为准。
 
@@ -118,7 +133,7 @@ docker compose down -v --remove-orphans
 
 ## 已知差异
 
-合成恒定参数，无真实到达轨迹导入，不实现非平稳到达、异速服务、放弃、有限排队空间或优先级。有限顾客从空系统开始并排空，默认暖机不足以证明稳态。t区间仅重复均值近似、不会解释模型偏差。单worker无running自动恢复/事务outbox/多实例锁，中断需重提；登录限流单进程。metadata首建表不是完整迁移链，字体网络不可用时回退。不执行现场排班。
+合成恒定参数，无真实到达轨迹导入，不实现非平稳到达、异速服务、放弃、有限排队空间或优先级。有限顾客从空系统开始并排空，默认暖机不足以证明稳态。t区间仅重复均值近似、不会解释模型偏差。单worker部署；中断可自动接管续算，但廉价的单写库租约不是跨机房共识，多实例并发仍建议用数据库唯一约束监控。登录限流单进程。metadata首建表不是完整迁移链，只有续算相关增量经`migrations/002_resumable_runs.sql`幂等应用；字体网络不可用时回退。不执行现场排班。
 
 ## License
 

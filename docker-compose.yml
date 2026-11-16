@@ -19,6 +19,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-local-demo-queue-lab-change-this-key}
       SEED_DEMO: ${SEED_DEMO:-true}
+      RUN_LEASE_SECONDS: ${RUN_LEASE_SECONDS:-120}
     ports: ["${BACKEND_PORT:-19220}:8000"]
     volumes: ["artifacts:/artifacts"]
     depends_on:

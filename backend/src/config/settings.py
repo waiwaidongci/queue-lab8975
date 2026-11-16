@@ -3,3 +3,7 @@ DATABASE_URL=os.environ.get("DATABASE_URL","postgresql+psycopg://queue:queue@db/
 REDIS_URL=os.environ.get("REDIS_URL","redis://redis:6379/0")
 JWT_SECRET=os.environ.get("JWT_SECRET","local-queue-lab-change-this-key")
 SEED_DEMO=os.environ.get("SEED_DEMO","true").lower()=="true"
+# A run is taken over automatically once its lease expires; the holder renews it
+# while a replication is being computed.
+RUN_LEASE_SECONDS=float(os.environ.get("RUN_LEASE_SECONDS","120"))
+ARTIFACT_DIR=os.environ.get("ARTIFACT_DIR","/artifacts")

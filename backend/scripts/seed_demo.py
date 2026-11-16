@@ -1,9 +1,12 @@
 import json
 from src.config.database import Base,engine,SessionLocal
-from src.models import User,QueueStudy,ArrivalProfile,ServiceScenario,SimulationRun,CapacityNote
+from src.config.settings import ARTIFACT_DIR
+from src.models import User,QueueStudy,ArrivalProfile,ServiceScenario,SimulationRun,RunReplication,CapacityNote
 from src.utils.security import hash_password
+from src.utils.clock import now
 from src.services.run_service import create_snapshot
 from src.services.comparison_service import calculate_run
+from src.services.artifact_service import write_artifact,result_version
 
 def seed():
     Base.metadata.create_all(engine)
@@ -27,9 +30,14 @@ def seed():
                 code=f"SC-{i+1}-{servers}";scenario=db.query(ServiceScenario).filter_by(code=code).first()
                 if not scenario:scenario=ServiceScenario(code=code,name=f"{profile.name} · {servers}台服务",profile_id=profile.id,servers=servers,mean_service_minutes=2.5 if i==0 else 1/.45,owner="季遥 · 排队分析员");db.add(scenario);db.flush()
                 scenarios.append(scenario)
-        if not db.query(SimulationRun).filter_by(name="上午双窗口 · 基准独立重复").first():
+        if not db.query(SimulationRun).filter_by(name="上午双窗口 · 基线独立重复").first():
             scenario=scenarios[0];snapshot=create_snapshot(db,scenario);result=calculate_run(snapshot,3000,500,20,2026,.95)
-            run=SimulationRun(name="上午双窗口 · 基准独立重复",scenario_id=scenario.id,customers=3000,warmup=500,replications=20,seed=2026,confidence=.95,input_snapshot=snapshot,status="completed",result=result,owner="季遥 · 排队分析员");db.add(run);db.flush()
+            version=result_version(result)
+            run=SimulationRun(name="上午双窗口 · 基线独立重复",scenario_id=scenario.id,customers=3000,warmup=500,replications=20,seed=2026,confidence=.95,input_snapshot=snapshot,status="completed",result=result,owner="季遥 · 排队分析员",progress_completed=20,progress_total=20,result_version=version,started_at=now(),completed_at=now(),attempt=1)
+            db.add(run);db.flush()
+            run.artifact_path=str(write_artifact(run.id,version,result,directory=ARTIFACT_DIR))
+            for item in result["replications"]:
+                db.add(RunReplication(run_id=run.id,replication=item["replication"],attempt=1,lease_token="seed",summary=item,sample_customers=result["sample_customers"] if item["replication"]==1 else []))
             db.add(CapacityNote(run_id=run.id,title="上午窗口容量观察底稿",interpretation="已区分稳态解析和有限顾客仿真，暖机与t区间仅描述模拟均值误差。",proposal="保留到达/服务假设，追加高负荷参数试验后再讨论现场窗口配置。",status="approved",owner="季遥 · 排队分析员",reviewer="陆潮 · 运营研究负责人",review_note="批准容量研究归档；不作为现场等待承诺或自动排班指令。"))
-        db.commit();print(json.dumps({m.__tablename__:db.query(m).count() for m in [User,QueueStudy,ArrivalProfile,ServiceScenario,SimulationRun,CapacityNote]},ensure_ascii=False))
+        db.commit();print(json.dumps({m.__tablename__:db.query(m).count() for m in [User,QueueStudy,ArrivalProfile,ServiceScenario,SimulationRun,RunReplication,CapacityNote]},ensure_ascii=False))
 if __name__=="__main__":seed()
